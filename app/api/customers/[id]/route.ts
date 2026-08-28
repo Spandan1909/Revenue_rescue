@@ -4,6 +4,8 @@ import { gatherEvidence, calculateRiskScore, riskLevelFromScore, diagnoseReason 
 import { recommendRecoveryAction } from '@/lib/recovery/decision';
 import type { Customer, Payment, Order, Subscription, RevenueRisk } from '@/lib/types';
 
+export const dynamic = 'force-dynamic';
+
 export async function GET(
   request: Request,
   { params }: { params: { id: string } }
