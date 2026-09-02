@@ -53,7 +53,7 @@ export async function seedDemoData(): Promise<SeedResult> {
       };
     }
   } else {
-    const { data: newBusiness } = await supabase
+    const { data: newBusiness, error: businessError } = await supabase
       .from('businesses')
       .insert({
         name: 'ShopNest India',
@@ -64,6 +64,14 @@ export async function seedDemoData(): Promise<SeedResult> {
       })
       .select()
       .single();
+      if (businessError) {
+        throw new Error(`Business insert failed: ${businessError.message}`);
+       }
+
+      if (!newBusiness) {
+         throw new Error('Business insert failed: no business was returned');
+       }
+
     businessId = (newBusiness as { id: string }).id;
   }
 
