@@ -10,22 +10,33 @@ export interface SeedResult {
   subscriptionsCreated: number;
 }
 
+class SeedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SeedError';
+  }
+}
+
 export async function seedDemoData(): Promise<SeedResult> {
   const supabase = createServerClient();
 
   // Check if business already exists
-  const { data: existingBusiness } = await supabase
+  const { data: existingBusiness, error: businessCheckError } = await supabase
     .from('businesses')
     .select('id')
     .limit(1)
     .maybeSingle();
+
+  if (businessCheckError) {
+    throw new SeedError(`Failed to check existing business: ${businessCheckError.message}`);
+  }
 
   let businessId: string;
 
   if (existingBusiness) {
     businessId = existingBusiness.id;
     // Ensure agent_config exists (idempotent)
-    await supabase.from('agent_config').upsert({
+    const { error: configUpsertError } = await supabase.from('agent_config').upsert({
       business_id: businessId,
       auto_analysis: true,
       auto_retry: false,
@@ -36,11 +47,18 @@ export async function seedDemoData(): Promise<SeedResult> {
       confidence_threshold: 65,
       agent_status: 'idle',
     });
+    if (configUpsertError) {
+      throw new SeedError(`Failed to create agent config: ${configUpsertError.message}`);
+    }
     // Check if we already have customers
-    const { count } = await supabase
+    const { count, error: countError } = await supabase
       .from('customers')
       .select('*', { count: 'exact', head: true })
       .eq('business_id', businessId);
+
+    if (countError) {
+      throw new SeedError(`Failed to check existing customers: ${countError.message}`);
+    }
 
     if (count && count > 0) {
       return {
@@ -53,7 +71,7 @@ export async function seedDemoData(): Promise<SeedResult> {
       };
     }
   } else {
-    const { data: newBusiness, error: businessError } = await supabase
+    const { data: newBusiness, error: businessInsertError } = await supabase
       .from('businesses')
       .insert({
         name: 'ShopNest India',
@@ -64,19 +82,17 @@ export async function seedDemoData(): Promise<SeedResult> {
       })
       .select()
       .single();
-      if (businessError) {
-        throw new Error(`Business insert failed: ${businessError.message}`);
-       }
 
-      if (!newBusiness) {
-         throw new Error('Business insert failed: no business was returned');
-       }
-
-    businessId = (newBusiness as { id: string }).id;
+    if (businessInsertError || !newBusiness) {
+      throw new SeedError(
+        `Failed to create business: ${businessInsertError?.message ?? 'No data returned'}`
+      );
+    }
+    businessId = newBusiness.id;
   }
 
   // Create agent config
-  await supabase.from('agent_config').upsert({
+  const { error: configError } = await supabase.from('agent_config').upsert({
     business_id: businessId,
     auto_analysis: true,
     auto_retry: false,
@@ -87,6 +103,9 @@ export async function seedDemoData(): Promise<SeedResult> {
     confidence_threshold: 65,
     agent_status: 'idle',
   });
+  if (configError) {
+    throw new SeedError(`Failed to create agent config: ${configError.message}`);
+  }
 
   // Seed customers
   const customers = [
@@ -102,11 +121,19 @@ export async function seedDemoData(): Promise<SeedResult> {
     { name: 'Divya Nair', email: 'divya.nair@gmail.com', phone: '5555444433', customer_number: 'CUST-0274', status: 'active', lifetime_value: 92997, total_orders: 19, last_payment_at: daysAgo(2), avg_payment_interval_days: 30 },
   ];
 
-  const { data: customerRows } = await supabase
+  const { data: customerRows, error: customerInsertError } = await supabase
     .from('customers')
     .insert(customers.map((c) => ({ ...c, business_id: businessId })))
     .select();
-  const createdCustomers = (customerRows || []) as { id: string; name: string; email: string; phone: string; customer_number: string }[];
+
+  if (customerInsertError) {
+    throw new SeedError(`Failed to create customers: ${customerInsertError.message}`);
+  }
+  if (!customerRows || customerRows.length === 0) {
+    throw new SeedError('Failed to create customers: no rows returned');
+  }
+
+  const createdCustomers = customerRows as { id: string; name: string; email: string; phone: string; customer_number: string }[];
 
   // Create orders and payments for each customer
   let ordersCreated = 0;
@@ -122,7 +149,7 @@ export async function seedDemoData(): Promise<SeedResult> {
       for (let j = 0; j < 2; j++) {
         const orderNum = `ORD-RS-${100 + j}`;
         const amount = 4999;
-        const { data: order } = await supabase
+        const { data: order, error: orderError } = await supabase
           .from('orders')
           .insert({
             business_id: businessId,
@@ -134,22 +161,29 @@ export async function seedDemoData(): Promise<SeedResult> {
           })
           .select()
           .single();
+
+        if (orderError || !order) {
+          throw new SeedError(`Failed to create order ${orderNum}: ${orderError?.message ?? 'No data returned'}`);
+        }
         ordersCreated++;
 
-        await supabase.from('payments').insert({
+        const { error: paymentError } = await supabase.from('payments').insert({
           business_id: businessId,
-          order_id: (order as { id: string }).id,
+          order_id: order.id,
           customer_id: c.id,
           amount,
           status: 'captured',
           method: 'upi',
           created_at: daysAgo(47 + j * 30),
         });
+        if (paymentError) {
+          throw new SeedError(`Failed to create payment for order ${orderNum}: ${paymentError.message}`);
+        }
         paymentsCreated++;
       }
 
       // Current failed payment
-      const { data: failedOrder } = await supabase
+      const { data: failedOrder, error: failedOrderError } = await supabase
         .from('orders')
         .insert({
           business_id: businessId,
@@ -161,11 +195,15 @@ export async function seedDemoData(): Promise<SeedResult> {
         })
         .select()
         .single();
+
+      if (failedOrderError || !failedOrder) {
+        throw new SeedError(`Failed to create failed order: ${failedOrderError?.message ?? 'No data returned'}`);
+      }
       ordersCreated++;
 
-      await supabase.from('payments').insert({
+      const { error: failedPaymentError } = await supabase.from('payments').insert({
         business_id: businessId,
-        order_id: (failedOrder as { id: string }).id,
+        order_id: failedOrder.id,
         customer_id: c.id,
         amount: 4999,
         status: 'failed',
@@ -175,12 +213,15 @@ export async function seedDemoData(): Promise<SeedResult> {
         retry_count: 1,
         created_at: daysAgo(3),
       });
+      if (failedPaymentError) {
+        throw new SeedError(`Failed to create failed payment: ${failedPaymentError.message}`);
+      }
       paymentsCreated++;
     }
 
     // Arun Kumar — inactive customer, subscription failure
     if (c.name === 'Arun Kumar') {
-      const { data: sub } = await supabase
+      const { data: sub, error: subError } = await supabase
         .from('subscriptions')
         .insert({
           business_id: businessId,
@@ -193,11 +234,15 @@ export async function seedDemoData(): Promise<SeedResult> {
         })
         .select()
         .single();
+
+      if (subError || !sub) {
+        throw new SeedError(`Failed to create subscription for Arun Kumar: ${subError?.message ?? 'No data returned'}`);
+      }
       subscriptionsCreated++;
 
       // Previous successful payments
       for (let j = 0; j < 5; j++) {
-        await supabase.from('payments').insert({
+        const { error: paymentError } = await supabase.from('payments').insert({
           business_id: businessId,
           order_id: null,
           customer_id: c.id,
@@ -206,11 +251,14 @@ export async function seedDemoData(): Promise<SeedResult> {
           method: 'upi',
           created_at: daysAgo(95 + j * 30),
         });
+        if (paymentError) {
+          throw new SeedError(`Failed to create payment for Arun Kumar: ${paymentError.message}`);
+        }
         paymentsCreated++;
       }
 
       // Failed subscription payment
-      await supabase.from('payments').insert({
+      const { error: failedSubPaymentError } = await supabase.from('payments').insert({
         business_id: businessId,
         order_id: null,
         customer_id: c.id,
@@ -222,12 +270,15 @@ export async function seedDemoData(): Promise<SeedResult> {
         retry_count: 2,
         created_at: daysAgo(95),
       });
+      if (failedSubPaymentError) {
+        throw new SeedError(`Failed to create failed subscription payment: ${failedSubPaymentError.message}`);
+      }
       paymentsCreated++;
     }
 
     // Priya Patel — abandoned checkout
     if (c.name === 'Priya Patel') {
-      const { data: abandonedOrder } = await supabase
+      const { data: abandonedOrder, error: abandonedError } = await supabase
         .from('orders')
         .insert({
           business_id: businessId,
@@ -239,11 +290,15 @@ export async function seedDemoData(): Promise<SeedResult> {
         })
         .select()
         .single();
+
+      if (abandonedError || !abandonedOrder) {
+        throw new SeedError(`Failed to create abandoned order: ${abandonedError?.message ?? 'No data returned'}`);
+      }
       ordersCreated++;
 
       // Previous successful payments
       for (let j = 0; j < 3; j++) {
-        await supabase.from('payments').insert({
+        const { error: paymentError } = await supabase.from('payments').insert({
           business_id: businessId,
           order_id: null,
           customer_id: c.id,
@@ -252,6 +307,9 @@ export async function seedDemoData(): Promise<SeedResult> {
           method: 'upi',
           created_at: daysAgo(12 + j * 45),
         });
+        if (paymentError) {
+          throw new SeedError(`Failed to create payment for Priya Patel: ${paymentError.message}`);
+        }
         paymentsCreated++;
       }
     }
@@ -259,7 +317,7 @@ export async function seedDemoData(): Promise<SeedResult> {
     // Vikram Singh — inactive customer
     if (c.name === 'Vikram Singh') {
       for (let j = 0; j < 4; j++) {
-        await supabase.from('payments').insert({
+        const { error: paymentError } = await supabase.from('payments').insert({
           business_id: businessId,
           order_id: null,
           customer_id: c.id,
@@ -268,13 +326,16 @@ export async function seedDemoData(): Promise<SeedResult> {
           method: 'upi',
           created_at: daysAgo(72 + j * 30),
         });
+        if (paymentError) {
+          throw new SeedError(`Failed to create payment for Vikram Singh: ${paymentError.message}`);
+        }
         paymentsCreated++;
       }
     }
 
     // Sneha Reddy — failed payment
     if (c.name === 'Sneha Reddy') {
-      const { data: order } = await supabase
+      const { data: order, error: orderError } = await supabase
         .from('orders')
         .insert({
           business_id: businessId,
@@ -286,11 +347,15 @@ export async function seedDemoData(): Promise<SeedResult> {
         })
         .select()
         .single();
+
+      if (orderError || !order) {
+        throw new SeedError(`Failed to create order for Sneha Reddy: ${orderError?.message ?? 'No data returned'}`);
+      }
       ordersCreated++;
 
-      await supabase.from('payments').insert({
+      const { error: failedPaymentError } = await supabase.from('payments').insert({
         business_id: businessId,
-        order_id: (order as { id: string }).id,
+        order_id: order.id,
         customer_id: c.id,
         amount: 2999,
         status: 'failed',
@@ -300,11 +365,14 @@ export async function seedDemoData(): Promise<SeedResult> {
         retry_count: 0,
         created_at: daysAgo(1),
       });
+      if (failedPaymentError) {
+        throw new SeedError(`Failed to create failed payment for Sneha Reddy: ${failedPaymentError.message}`);
+      }
       paymentsCreated++;
 
       // Previous successful payments
       for (let j = 0; j < 2; j++) {
-        await supabase.from('payments').insert({
+        const { error: paymentError } = await supabase.from('payments').insert({
           business_id: businessId,
           order_id: null,
           customer_id: c.id,
@@ -313,13 +381,16 @@ export async function seedDemoData(): Promise<SeedResult> {
           method: 'upi',
           created_at: daysAgo(5 + j * 60),
         });
+        if (paymentError) {
+          throw new SeedError(`Failed to create payment for Sneha Reddy: ${paymentError.message}`);
+        }
         paymentsCreated++;
       }
     }
 
     // Meera Joshi — inactive + subscription failure
     if (c.name === 'Meera Joshi') {
-      const { data: sub } = await supabase
+      const { data: sub, error: subError } = await supabase
         .from('subscriptions')
         .insert({
           business_id: businessId,
@@ -332,10 +403,14 @@ export async function seedDemoData(): Promise<SeedResult> {
         })
         .select()
         .single();
+
+      if (subError || !sub) {
+        throw new SeedError(`Failed to create subscription for Meera Joshi: ${subError?.message ?? 'No data returned'}`);
+      }
       subscriptionsCreated++;
 
       for (let j = 0; j < 3; j++) {
-        await supabase.from('payments').insert({
+        const { error: paymentError } = await supabase.from('payments').insert({
           business_id: businessId,
           order_id: null,
           customer_id: c.id,
@@ -344,10 +419,13 @@ export async function seedDemoData(): Promise<SeedResult> {
           method: 'card',
           created_at: daysAgo(110 + j * 365),
         });
+        if (paymentError) {
+          throw new SeedError(`Failed to create payment for Meera Joshi: ${paymentError.message}`);
+        }
         paymentsCreated++;
       }
 
-      await supabase.from('payments').insert({
+      const { error: failedSubPaymentError } = await supabase.from('payments').insert({
         business_id: businessId,
         order_id: null,
         customer_id: c.id,
@@ -359,12 +437,15 @@ export async function seedDemoData(): Promise<SeedResult> {
         retry_count: 3,
         created_at: daysAgo(110),
       });
+      if (failedSubPaymentError) {
+        throw new SeedError(`Failed to create failed subscription payment for Meera Joshi: ${failedSubPaymentError.message}`);
+      }
       paymentsCreated++;
     }
 
     // Karthik Iyer — abandoned checkout
     if (c.name === 'Karthik Iyer') {
-      await supabase.from('orders').insert({
+      const { error: orderError } = await supabase.from('orders').insert({
         business_id: businessId,
         customer_id: c.id,
         order_number: 'ORD-KI-401',
@@ -372,10 +453,13 @@ export async function seedDemoData(): Promise<SeedResult> {
         status: 'abandoned',
         created_at: daysAgo(4),
       });
+      if (orderError) {
+        throw new SeedError(`Failed to create order for Karthik Iyer: ${orderError.message}`);
+      }
       ordersCreated++;
 
       for (let j = 0; j < 3; j++) {
-        await supabase.from('payments').insert({
+        const { error: paymentError } = await supabase.from('payments').insert({
           business_id: businessId,
           order_id: null,
           customer_id: c.id,
@@ -384,6 +468,9 @@ export async function seedDemoData(): Promise<SeedResult> {
           method: 'upi',
           created_at: daysAgo(18 + j * 45),
         });
+        if (paymentError) {
+          throw new SeedError(`Failed to create payment for Karthik Iyer: ${paymentError.message}`);
+        }
         paymentsCreated++;
       }
     }
@@ -413,7 +500,7 @@ export async function seedDemoData(): Promise<SeedResult> {
     const customer = createdCustomers.find((c) => c.name === risk.customer_name);
     if (!customer) continue;
 
-    await supabase.from('revenue_risks').insert({
+    const { error: riskError } = await supabase.from('revenue_risks').insert({
       business_id: businessId,
       customer_id: customer.id,
       amount: risk.amount,
@@ -424,6 +511,9 @@ export async function seedDemoData(): Promise<SeedResult> {
       recommended_action: risk.recommended_action,
       status: 'open',
     });
+    if (riskError) {
+      throw new SeedError(`Failed to create risk for ${risk.customer_name}: ${riskError.message}`);
+    }
     risksCreated++;
   }
 
