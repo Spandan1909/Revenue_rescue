@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createServerClient } from '@/lib/supabase/server';
 import { runAgentForRisk } from '@/lib/agents/revenue-rescue';
-import { recordAudit } from '@/lib/audit/logger';
 
 export async function POST() {
   try {
@@ -34,14 +33,21 @@ export async function POST() {
       return NextResponse.json({ error: 'No risk found for demo customer' }, { status: 400 });
     }
 
-    // Run the agent on this risk
+    // Reset the risk to 'open' so the simulation can always be re-run as a demo
+    await supabase
+      .from('revenue_risks')
+      .update({
+        status: 'open',
+        recommended_action: null,
+        resolved_at: null,
+      })
+      .eq('id', risk.id);
+
+    // Run the agent on this risk — return result directly so the Agent page
+    // can read assessment/decision/approvalNeeded at the top level.
     const result = await runAgentForRisk(risk.id, business.id);
 
-    return NextResponse.json({
-      success: true,
-      result,
-      message: 'Agent analysis complete. Check the Approvals page for pending actions.',
-    });
+    return NextResponse.json(result);
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     return NextResponse.json({ error: msg }, { status: 500 });
